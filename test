@@ -1,0 +1,472 @@
+
+package collect
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/payload"
+
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic/fake"
+)
+
+
+func metricResponse(
+	nodes map[string]string,
+	label string,
+) string {
+	results := []map[string]interface{}{}
+
+	for name, value := range nodes {
+		results = append(results, map[string]interface{}{
+			"metric": map[string]string{label: name},
+			"value":  []interface{}{1760000000, value},
+		})
+	}
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"status": "success",
+		"data": map[string]interface{}{
+			"resultType": "vector",
+			"result":     results,
+		},
+	})
+
+	return string(body)
+}
+
+// Returns mocked data for all six Thanos queries.
+func testMetricHandler(
+	t *testing.T,
+) http.HandlerFunc {
+	t.Helper()
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query().Get("query")
+
+		if r.URL.Path != "/api/v1/query" {
+			t.Errorf("unexpected API path: %s", r.URL.Path)
+			http.Error(w, "wrong path", http.StatusNotFound)
+			return
+		}
+
+		var response string
+
+		switch {
+		case strings.Contains(query, "node_cpu_seconds_total"):
+			response = metricResponse(map[string]string{
+				"worker-a": "2.5",
+				"worker-b": "3.2",
+			}, "instance")
+
+		case strings.Contains(query, `resource="cpu"`):
+			response = metricResponse(map[string]string{
+				"worker-a": "8",
+				"worker-b": "16",
+			}, "node")
+
+		case strings.Contains(query, "node_memory_MemTotal_bytes"):
+			response = metricResponse(map[string]string{
+				"worker-a": "8000000000",
+				"worker-b": "9000000000",
+			}, "instance")
+
+		case strings.Contains(query, `resource="memory"`):
+			response = metricResponse(map[string]string{
+				"worker-a": "16000000000",
+				"worker-b": "32000000000",
+			}, "node")
+
+		case strings.Contains(query, "kube_pod_info"):
+			response = metricResponse(map[string]string{
+				"worker-a": "95",
+				"worker-b": "110",
+			}, "node")
+
+		case strings.Contains(query, `resource="pods"`):
+			response = metricResponse(map[string]string{
+				"worker-a": "250",
+				"worker-b": "250",
+			}, "node")
+
+		default:
+			t.Errorf("unexpected PromQL: %s", query)
+			http.Error(w, "unknown query", http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, response)
+	}
+}
+
+
+func TestThanosAllMetricsAndEnrichment(t *testing.T) {
+	server := httptest.NewServer(testMetricHandler(t))
+	defer server.Close()
+
+	client := &ThanosClient{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	}
+
+	metrics, err := client.CollectNodeMetrics(
+		context.Background(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(metrics) != 2 {
+		t.Fatalf("expected 2 nodes, got %d", len(metrics))
+	}
+
+	nodes := []payload.Node{
+		{Name: "worker-a"},
+		{Name: "worker-b"},
+	}
+
+	EnrichNodesWithMetrics(nodes, metrics)
+
+	a := nodes[0]
+	b := nodes[1]
+
+	if a.CPUUsageCores != 2.5 ||
+		a.CPUCapacityCores != 8 ||
+		a.MemoryUsageBytes != 8000000000 ||
+		a.MemoryCapacityBytes != 16000000000 ||
+		a.PodCount != 95 ||
+		a.PodCapacity != 250 {
+		t.Errorf("incorrect worker-a metrics: %+v", a)
+	}
+
+	if b.CPUUsageCores != 3.2 ||
+		b.CPUCapacityCores != 16 ||
+		b.MemoryUsageBytes != 9000000000 ||
+		b.MemoryCapacityBytes != 32000000000 ||
+		b.PodCount != 110 ||
+		b.PodCapacity != 250 {
+		t.Errorf("incorrect worker-b metrics: %+v", b)
+	}
+}
+
+
+func TestThanosMissingMetrics(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, metricResponse(
+				map[string]string{},
+				"node",
+			))
+		},
+	))
+	defer server.Close()
+
+	client := &ThanosClient{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	}
+
+	_, err := client.CollectNodeMetrics(context.Background())
+
+	// This expresses the proposed strict missing-data policy.
+	// The initial implementation may fail this test.
+	if err == nil {
+		t.Fatal("expected missing metrics to be reported")
+	}
+}
+
+
+func TestThanosDuplicateMetrics(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, `{
+				"status":"success",
+				"data":{
+					"resultType":"vector",
+					"result":[
+						{
+							"metric":{"node":"worker-a"},
+							"value":[1760000000,"8"]
+						},
+						{
+							"metric":{"node":"worker-a"},
+							"value":[1760000000,"16"]
+						}
+					]
+				}
+			}`)
+		},
+	))
+	defer server.Close()
+
+	client := &ThanosClient{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	}
+
+	_, err := client.CollectNodeMetrics(context.Background())
+
+	// Proposed behavior: reject ambiguous duplicate series.
+	if err == nil {
+		t.Fatal("expected duplicate series error")
+	}
+}
+
+
+func TestThanosInvalidNumbers(t *testing.T) {
+	for _, value := range []string{
+		"NaN",
+		"+Inf",
+		"-Inf",
+		"not-a-number",
+	} {
+		t.Run(value, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					fmt.Fprint(w, metricResponse(
+						map[string]string{
+							"worker-a": value,
+						},
+						"node",
+					))
+				},
+			))
+			defer server.Close()
+
+			client := &ThanosClient{
+				BaseURL:    server.URL,
+				HTTPClient: server.Client(),
+			}
+
+			samples, err := client.Query(
+				context.Background(),
+				"test_metric",
+			)
+
+			if err == nil {
+				if len(samples) > 0 &&
+					(math.IsNaN(samples[0].Value) ||
+						math.IsInf(samples[0].Value, 0)) {
+					t.Fatalf("non-finite value accepted: %s", value)
+				}
+				t.Fatalf("expected invalid metric error for %s", value)
+			}
+		})
+	}
+}
+
+
+func TestThanosHTTPAndAPIErrors(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{
+			name:   "forbidden",
+			status: http.StatusForbidden,
+			body:   "Forbidden",
+		},
+		{
+			name:   "server error",
+			status: http.StatusInternalServerError,
+			body:   "Internal error",
+		},
+		{
+			name:   "invalid JSON",
+			status: http.StatusOK,
+			body:   "invalid-json",
+		},
+		{
+			name:   "Prometheus API error",
+			status: http.StatusOK,
+			body: `{
+				"status":"error",
+				"errorType":"bad_data",
+				"error":"invalid expression"
+			}`,
+		},
+		{
+			name:   "unexpected result type",
+			status: http.StatusOK,
+			body: `{
+				"status":"success",
+				"data":{
+					"resultType":"scalar",
+					"result":[]
+				}
+			}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(tc.status)
+					fmt.Fprint(w, tc.body)
+				},
+			))
+			defer server.Close()
+
+			client := &ThanosClient{
+				BaseURL:    server.URL,
+				HTTPClient: server.Client(),
+			}
+
+			_, err := client.Query(
+				context.Background(),
+				"up",
+			)
+
+			if err == nil {
+				t.Fatal("expected Thanos API error")
+			}
+		})
+	}
+}
+
+
+func TestThanosEmptyVector(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, metricResponse(
+				map[string]string{},
+				"node",
+			))
+		},
+	))
+	defer server.Close()
+
+	client := &ThanosClient{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	}
+
+	samples, err := client.Query(
+		context.Background(),
+		"nonexistent_metric",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(samples) != 0 {
+		t.Fatalf("expected empty vector, got %d", len(samples))
+	}
+}
+
+
+func TestThanosRequestCancellation(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		},
+	))
+	defer server.Close()
+
+	client := &ThanosClient{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	}
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		100*time.Millisecond,
+	)
+	defer cancel()
+
+	_, err := client.Query(ctx, "up")
+	if err == nil {
+		t.Fatal("expected timeout or cancellation error")
+	}
+}
+
+// TEST 9: Combined Kubernetes + Thanos collection.
+func TestThanosCombinedPayload(t *testing.T) {
+	node := &unstructured.Unstructured{
+		Object: map[string]interface{}{
+			"apiVersion": "v1",
+			"kind":       "Node",
+			"metadata": map[string]interface{}{
+				"name": "worker-a",
+				"labels": map[string]interface{}{
+					"node-role.kubernetes.io/worker": "",
+				},
+			},
+			"status": map[string]interface{}{
+				"conditions": []interface{}{
+					map[string]interface{}{
+						"type":   "Ready",
+						"status": "True",
+					},
+				},
+			},
+		},
+	}
+
+	k8sClient := fake.NewSimpleDynamicClientWithCustomListKinds(
+		runtime.NewScheme(),
+		map[schema.GroupVersionResource]string{
+			nodesGVR:     "NodeList",
+			operatorsGVR: "ClusterOperatorList",
+			mcpsGVR:      "MachineConfigPoolList",
+		},
+		node,
+	)
+
+	server := httptest.NewServer(testMetricHandler(t))
+	defer server.Close()
+
+	thanosClient := &ThanosClient{
+		BaseURL:    server.URL,
+		HTTPClient: server.Client(),
+	}
+
+	result, err := CollectWithThanos(
+		context.Background(),
+		k8sClient,
+		thanosClient,
+		"xoicu1",
+		"0.1.0",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if result.ClusterID != "xoicu1" {
+		t.Errorf("unexpected cluster ID: %s", result.ClusterID)
+	}
+
+	if len(result.Nodes) != 1 {
+		t.Fatalf("expected 1 node, got %d", len(result.Nodes))
+	}
+
+	got := result.Nodes[0]
+	if got.CPUUsageCores != 2.5 ||
+		got.CPUCapacityCores != 8 ||
+		got.MemoryUsageBytes != 8000000000 ||
+		got.PodCount != 95 ||
+		got.PodCapacity != 250 {
+		t.Errorf("combined node metrics incorrect: %+v", got)
+	}
+
+	if result.MachineConfigPools == nil {
+		t.Error("expected non-nil MCP array")
+	}
+
+	if result.CollectedAt.IsZero() {
+		t.Error("missing collection timestamp")
+	}
+}
