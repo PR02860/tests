@@ -1,4 +1,40 @@
 
+func CollectWithThanos(
+	ctx context.Context,
+	k8sClient dynamic.Interface,
+	thanosClient *ThanosClient,
+	clusterID string,
+	agentVersion string,
+) (payload.Payload, error) {
+
+	result, err := Collect(
+		ctx,
+		k8sClient,
+		clusterID,
+		agentVersion,
+	)
+	if err != nil {
+		return payload.Payload{}, err
+	}
+
+	if thanosClient == nil {
+		return payload.Payload{},
+			fmt.Errorf("Thanos client is required")
+	}
+
+	metrics, err := thanosClient.CollectNodeMetrics(ctx)
+	if err != nil {
+		return payload.Payload{},
+			fmt.Errorf("collect Thanos node metrics: %w", err)
+	}
+
+	EnrichNodesWithMetrics(result.Nodes, metrics)
+
+	return result, nil
+}
+
+"git.bcbssc.com/InformationSystems/ocp_status/internal/payload"
+"k8s.io/client-go/dynamic"
 package collect
 
 import (
