@@ -1,0 +1,110 @@
+
+package agent
+
+import (
+	"bytes"
+	"strings"
+	"testing"
+)
+
+func TestAgentRunHelp(t *testing.T) {
+	command := newRunCommand()
+
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetErr(&output)
+	command.SetArgs([]string{"--help"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("help command failed: %v", err)
+	}
+
+	for _, expected := range []string{
+		"--cluster-id",
+		"--collector-url",
+		"--thanos-url",
+		"--kubeconfig",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Errorf("help missing %s", expected)
+		}
+	}
+}
+
+func TestAgentRunRequiresClusterID(t *testing.T) {
+	t.Setenv("OCP_STATUS_CLUSTER_ID", "")
+	t.Setenv("OCP_STATUS_HMAC_KEY", "test-secret")
+
+	command := newRunCommand()
+	command.SetSilenceUsage(true)
+	command.SetSilenceErrors(true)
+
+	err := command.Execute()
+
+	if err == nil ||
+		!strings.Contains(err.Error(), "cluster ID is required") {
+		t.Fatalf("expected missing cluster ID, got %v", err)
+	}
+}
+
+func TestAgentRunRequiresCollectorURL(t *testing.T) {
+	t.Setenv("OCP_STATUS_HMAC_KEY", "test-secret")
+	t.Setenv("OCP_STATUS_COLLECTOR_URL", "")
+
+	command := newRunCommand()
+	command.SetSilenceUsage(true)
+	command.SetSilenceErrors(true)
+
+	command.SetArgs([]string{
+		"--cluster-id", "xoicu1",
+	})
+
+	err := command.Execute()
+
+	if err == nil ||
+		!strings.Contains(err.Error(), "collector URL is required") {
+		t.Fatalf("expected missing collector URL, got %v", err)
+	}
+}
+
+func TestAgentRunRequiresThanosURL(t *testing.T) {
+	t.Setenv("OCP_STATUS_HMAC_KEY", "test-secret")
+	t.Setenv("OCP_STATUS_THANOS_URL", "")
+
+	command := newRunCommand()
+	command.SetSilenceUsage(true)
+	command.SetSilenceErrors(true)
+
+	command.SetArgs([]string{
+		"--cluster-id", "xoicu1",
+		"--collector-url", "http://localhost:8080/api/status",
+	})
+
+	err := command.Execute()
+
+	if err == nil ||
+		!strings.Contains(err.Error(), "Thanos URL is required") {
+		t.Fatalf("expected missing Thanos URL, got %v", err)
+	}
+}
+
+func TestAgentRunRequiresHMACKey(t *testing.T) {
+	t.Setenv("OCP_STATUS_HMAC_KEY", "")
+
+	command := newRunCommand()
+	command.SetSilenceUsage(true)
+	command.SetSilenceErrors(true)
+
+	command.SetArgs([]string{
+		"--cluster-id", "xoicu1",
+		"--collector-url", "http://localhost:8080/api/status",
+		"--thanos-url", "http://localhost:9091",
+	})
+
+	err := command.Execute()
+
+	if err == nil ||
+		!strings.Contains(err.Error(), "OCP_STATUS_HMAC_KEY") {
+		t.Fatalf("expected missing HMAC key, got %v", err)
+	}
+}
