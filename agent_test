@@ -2,109 +2,374 @@
 package agent
 
 import (
-	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"math"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
+
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/auth"
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/payload"
 )
 
-func TestAgentRunHelp(t *testing.T) {
-	command := newRunCommand()
-
-	var output bytes.Buffer
-	command.SetOut(&output)
-	command.SetErr(&output)
-	command.SetArgs([]string{"--help"})
-
-	if err := command.Execute(); err != nil {
-		t.Fatalf("help command failed: %v", err)
-	}
-
-	for _, expected := range []string{
-		"--cluster-id",
-		"--collector-url",
-		"--thanos-url",
-		"--kubeconfig",
-	} {
-		if !strings.Contains(output.String(), expected) {
-			t.Errorf("help missing %s", expected)
-		}
-	}
+func mockPayload(
+	ctx context.Context,
+	clusterID, version string,
+) (payload.Payload, error) {
+	return payload.Payload{
+		ClusterID:    clusterID,
+		AgentVersion: version,
+		CollectedAt:  time.Now().UTC(),
+		Nodes: []payload.Node{
+			{
+				Name:                "worker-a",
+				Ready:               true,
+				CPUUsageCores:       2.5,
+				CPUCapacityCores:    8,
+				MemoryUsageBytes:    8000000000,
+				MemoryCapacityBytes: 16000000000,
+				PodCount:            95,
+				PodCapacity:         250,
+			},
+		},
+		ClusterOperators:   []payload.ClusterOperator{},
+		MachineConfigPools: []payload.MachineConfigPool{},
+	}, nil
 }
 
-func TestAgentRunRequiresClusterID(t *testing.T) {
-	t.Setenv("OCP_STATUS_CLUSTER_ID", "")
-	t.Setenv("OCP_STATUS_HMAC_KEY", "test-secret")
+func newTestCommand(
+	t *testing.T,
+	endpoint string,
+	deps runDependencies,
+) error {
+	t.Helper()
 
-	command := newRunCommand()
-	command.SetSilenceUsage(true)
-	command.SetSilenceErrors(true)
+	t.Setenv("OCP_STATUS_HMAC_KEY", "local-test-secret")
 
-	err := command.Execute()
+	cmd := newRunCommandWithDeps(deps)
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	cmd.SilenceUsage = true
+	cmd.SilenceErrors = true
 
-	if err == nil ||
-		!strings.Contains(err.Error(), "cluster ID is required") {
-		t.Fatalf("expected missing cluster ID, got %v", err)
-	}
-}
-
-func TestAgentRunRequiresCollectorURL(t *testing.T) {
-	t.Setenv("OCP_STATUS_HMAC_KEY", "test-secret")
-	t.Setenv("OCP_STATUS_COLLECTOR_URL", "")
-
-	command := newRunCommand()
-	command.SetSilenceUsage(true)
-	command.SetSilenceErrors(true)
-
-	command.SetArgs([]string{
+	cmd.SetArgs([]string{
 		"--cluster-id", "xoicu1",
+		"--collector-url", endpoint,
+		"--agent-version", "0.1.0",
 	})
 
-	err := command.Execute()
+	return cmd.Execute()
+}
 
-	if err == nil ||
-		!strings.Contains(err.Error(), "collector URL is required") {
-		t.Fatalf("expected missing collector URL, got %v", err)
+
+func TestAgentRunSuccess(t *testing.T) {
+	received := false
+
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			received = true
+
+			if r.Method != http.MethodPost {
+				t.Errorf("expected POST, got %s", r.Method)
+			}
+			if r.URL.Path != "/api/status" {
+				t.Errorf("unexpected path: %s", r.URL.Path)
+			}
+			if r.Header.Get("Content-Type") != "application/json" {
+				t.Error("incorrect content type")
+			}
+			if r.Header.Get("X-Cluster-ID") != "xoicu1" {
+				t.Error("incorrect cluster ID header")
+			}
+
+			// Verify the token with the existing HMAC helper.
+			err := auth.Verify(
+				[]byte("local-test-secret"),
+				"xoicu1",
+				r.Header.Get("X-Cluster-Token"),
+			)
+			if err != nil {
+				t.Errorf("invalid HMAC token: %v", err)
+			}
+
+			var got payload.Payload
+			if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+				t.Errorf("decode payload: %v", err)
+				return
+			}
+
+			if got.ClusterID != "xoicu1" {
+				t.Errorf("wrong cluster ID: %s", got.ClusterID)
+			}
+			if len(got.Nodes) != 1 {
+				t.Errorf("expected one node, got %d", len(got.Nodes))
+				return
+			}
+
+			node := got.Nodes[0]
+			if node.CPUUsageCores != 2.5 ||
+				node.CPUCapacityCores != 8 ||
+				node.MemoryUsageBytes != 8000000000 ||
+				node.MemoryCapacityBytes != 16000000000 ||
+				node.PodCount != 95 ||
+				node.PodCapacity != 250 {
+				t.Errorf("incorrect node data: %+v", node)
+			}
+
+			w.WriteHeader(http.StatusAccepted)
+		},
+	))
+	defer server.Close()
+
+	err := newTestCommand(
+		t,
+		server.URL+"/api/status",
+		runDependencies{
+			collectPayload: mockPayload,
+			computeToken:   auth.ComputeToken,
+			httpClient:    server.Client(),
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !received {
+		t.Fatal("collector did not receive payload")
 	}
 }
 
-func TestAgentRunRequiresThanosURL(t *testing.T) {
-	t.Setenv("OCP_STATUS_HMAC_KEY", "test-secret")
-	t.Setenv("OCP_STATUS_THANOS_URL", "")
 
-	command := newRunCommand()
-	command.SetSilenceUsage(true)
-	command.SetSilenceErrors(true)
+func TestAgentRunCollectionError(t *testing.T) {
+	deps := runDependencies{
+		collectPayload: func(
+			ctx context.Context,
+			id, version string,
+		) (payload.Payload, error) {
+			return payload.Payload{},
+				errors.New("Kubernetes unavailable")
+		},
+		computeToken: auth.ComputeToken,
+	}
 
-	command.SetArgs([]string{
-		"--cluster-id", "xoicu1",
-		"--collector-url", "http://localhost:8080/api/status",
-	})
-
-	err := command.Execute()
+	err := newTestCommand(
+		t,
+		"http://localhost:12345/api/status",
+		deps,
+	)
 
 	if err == nil ||
-		!strings.Contains(err.Error(), "Thanos URL is required") {
-		t.Fatalf("expected missing Thanos URL, got %v", err)
+		!strings.Contains(err.Error(), "collect cluster status") {
+		t.Fatalf("expected collection error, got %v", err)
 	}
 }
 
-func TestAgentRunRequiresHMACKey(t *testing.T) {
-	t.Setenv("OCP_STATUS_HMAC_KEY", "")
 
-	command := newRunCommand()
-	command.SetSilenceUsage(true)
-	command.SetSilenceErrors(true)
+func TestAgentRunHMACError(t *testing.T) {
+	deps := runDependencies{
+		collectPayload: mockPayload,
+		computeToken: func(
+			key []byte, id string,
+		) (string, error) {
+			return "", errors.New("HMAC failed")
+		},
+	}
 
-	command.SetArgs([]string{
-		"--cluster-id", "xoicu1",
-		"--collector-url", "http://localhost:8080/api/status",
-		"--thanos-url", "http://localhost:9091",
-	})
-
-	err := command.Execute()
+	err := newTestCommand(
+		t,
+		"http://localhost:12345/api/status",
+		deps,
+	)
 
 	if err == nil ||
-		!strings.Contains(err.Error(), "OCP_STATUS_HMAC_KEY") {
-		t.Fatalf("expected missing HMAC key, got %v", err)
+		!strings.Contains(err.Error(), "compute HMAC") {
+		t.Fatalf("expected HMAC error, got %v", err)
+	}
+}
+
+
+func TestAgentRunMarshalError(t *testing.T) {
+	deps := runDependencies{
+		collectPayload: func(
+			ctx context.Context,
+			id, version string,
+		) (payload.Payload, error) {
+			return payload.Payload{
+				ClusterID: id,
+				Nodes: []payload.Node{
+					{Name: "worker-a", CPUUsageCores: math.NaN()},
+				},
+			}, nil
+		},
+		computeToken: auth.ComputeToken,
+	}
+
+	err := newTestCommand(
+		t,
+		"http://localhost:12345/api/status",
+		deps,
+	)
+
+	if err == nil ||
+		!strings.Contains(err.Error(), "marshal payload") {
+		t.Fatalf("expected marshal error, got %v", err)
+	}
+}
+
+func TestAgentRunHTTPStatuses(t *testing.T) {
+	tests := []struct {
+		name        string
+		status      int
+		expectError bool
+	}{
+		{"ok", 200, false},
+		{"accepted", 202, false},
+		{"bad_request", 400, true},
+		{"unauthorized", 401, true},
+		{"forbidden", 403, true},
+		{"server_error", 500, true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(tc.status)
+				},
+			))
+			defer server.Close()
+
+			err := newTestCommand(
+				t,
+				server.URL,
+				runDependencies{
+					collectPayload: mockPayload,
+					computeToken:   auth.ComputeToken,
+				},
+			)
+
+			if tc.expectError && err == nil {
+				t.Fatal("expected HTTP failure")
+			}
+			if !tc.expectError && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+
+func TestAgentRunClusterMismatch(t *testing.T) {
+	deps := runDependencies{
+		collectPayload: func(
+			ctx context.Context,
+			id, version string,
+		) (payload.Payload, error) {
+			return payload.Payload{
+				ClusterID: "different-cluster",
+			}, nil
+		},
+		computeToken: auth.ComputeToken,
+	}
+
+	err := newTestCommand(
+		t,
+		"http://localhost:12345",
+		deps,
+	)
+
+	if err == nil ||
+		!strings.Contains(err.Error(), "cluster ID mismatch") {
+		t.Fatalf("expected cluster mismatch, got %v", err)
+	}
+}
+
+
+func TestAgentRunMissingConfig(t *testing.T) {
+	tests := []struct {
+		name       string
+		clusterID  string
+		url        string
+		key        string
+		expected   string
+	}{
+		{
+			name:     "missing_cluster",
+			url:      "http://localhost:12345",
+			key:      "secret",
+			expected: "cluster ID is required",
+		},
+		{
+			name:      "missing_url",
+			clusterID: "xoicu1",
+			key:       "secret",
+			expected:  "collector URL is required",
+		},
+		{
+			name:      "missing_key",
+			clusterID: "xoicu1",
+			url:       "http://localhost:12345",
+			expected:  "OCP_STATUS_HMAC_KEY is required",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("OCP_STATUS_HMAC_KEY", tc.key)
+
+			cmd := newRunCommandWithDeps(runDependencies{
+				collectPayload: mockPayload,
+			})
+			cmd.SetOut(io.Discard)
+			cmd.SetErr(io.Discard)
+			cmd.SilenceUsage = true
+			cmd.SilenceErrors = true
+
+			cmd.SetArgs([]string{
+				"--cluster-id", tc.clusterID,
+				"--collector-url", tc.url,
+			})
+
+			err := cmd.Execute()
+			if err == nil ||
+				!strings.Contains(err.Error(), tc.expected) {
+				t.Fatalf("expected %q, got %v", tc.expected, err)
+			}
+		})
+	}
+}
+
+
+func TestAgentRunCancelledContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(
+		func(w http.ResponseWriter, r *http.Request) {
+			<-r.Context().Done()
+		},
+	))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(
+		context.Background(),
+		100*time.Millisecond,
+	)
+	defer cancel()
+
+	err := executeAgentRun(
+		ctx,
+		mockPayload,
+		auth.ComputeToken,
+		server.Client(),
+		"xoicu1",
+		"0.1.0",
+		server.URL,
+		[]byte("local-test-secret"),
+	)
+
+	if err == nil {
+		t.Fatal("expected cancellation error")
 	}
 }
