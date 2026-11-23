@@ -2,12 +2,17 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
-	"git.bcbssc.com/InformationSystems/ocp_status/internal/agentrun"
 	"git.bcbssc.com/InformationSystems/ocp_status/internal/auth"
 	"git.bcbssc.com/InformationSystems/ocp_status/internal/collect"
 	"git.bcbssc.com/InformationSystems/ocp_status/internal/payload"
@@ -18,7 +23,24 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+
+type runDependencies struct {
+	collectPayload func(
+		context.Context, string, string,
+	) (payload.Payload, error)
+
+	computeToken func(
+		[]byte, string,
+	) (string, error)
+
+	httpClient *http.Client
+}
+
 func newRunCommand() *cobra.Command {
+	return newRunCommandWithDeps(runDependencies{})
+}
+
+func newRunCommandWithDeps(deps runDependencies) *cobra.Command {
 	var clusterID string
 	var collectorURL string
 	var thanosURL string
@@ -26,7 +48,7 @@ func newRunCommand() *cobra.Command {
 	var agentVersion string
 	var kubeconfig string
 
-	command := &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Collect cluster status and send it to the collector",
 		Args:  cobra.NoArgs,
@@ -34,139 +56,231 @@ func newRunCommand() *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
-			
-			hmacKey := os.Getenv("OCP_STATUS_HMAC_KEY")
+			key := []byte(os.Getenv("OCP_STATUS_HMAC_KEY"))
 
 			if strings.TrimSpace(clusterID) == "" {
 				return fmt.Errorf("cluster ID is required")
 			}
-
 			if strings.TrimSpace(collectorURL) == "" {
 				return fmt.Errorf("collector URL is required")
 			}
+			if len(key) == 0 {
+				return fmt.Errorf(
+					"OCP_STATUS_HMAC_KEY is required",
+				)
+			}
 
-			if strings.TrimSpace(thanosURL) == "" {
+			if deps.collectPayload == nil &&
+				strings.TrimSpace(thanosURL) == "" {
 				return fmt.Errorf("Thanos URL is required")
 			}
 
-			if hmacKey == "" {
-				return fmt.Errorf(
-					"OCP_STATUS_HMAC_KEY environment variable is required",
-				)
+			collector := deps.collectPayload
+			if collector == nil {
+				collector = func(
+					ctx context.Context,
+					id string,
+					version string,
+				) (payload.Payload, error) {
+					config, err := loadKubernetesConfig(kubeconfig)
+					if err != nil {
+						return payload.Payload{}, fmt.Errorf(
+							"configure Kubernetes client: %w", err,
+						)
+					}
+
+					k8sClient, err := dynamic.NewForConfig(config)
+					if err != nil {
+						return payload.Payload{}, fmt.Errorf(
+							"create Kubernetes client: %w", err,
+						)
+					}
+
+					thanosClient := &collect.ThanosClient{
+						BaseURL: thanosURL,
+						Token:   thanosToken,
+					}
+
+					return collect.CollectWithThanos(
+						ctx,
+						k8sClient,
+						thanosClient,
+						id,
+						version,
+					)
+				}
 			}
 
-		
-			restConfig, err := kubernetesConfig(kubeconfig)
+			tokenComputer := deps.computeToken
+			if tokenComputer == nil {
+				tokenComputer = auth.ComputeToken
+			}
+
+			httpClient := deps.httpClient
+			if httpClient == nil {
+				httpClient = &http.Client{
+					Timeout: 15 * time.Second,
+				}
+			}
+
+			err := executeAgentRun(
+				ctx,
+				collector,
+				tokenComputer,
+				httpClient,
+				clusterID,
+				agentVersion,
+				collectorURL,
+				key,
+			)
 			if err != nil {
-				return fmt.Errorf(
-					"configure Kubernetes client: %w",
-					err,
-				)
-			}
-
-			k8sClient, err := dynamic.NewForConfig(restConfig)
-			if err != nil {
-				return fmt.Errorf(
-					"create Kubernetes client: %w",
-					err,
-				)
-			}
-
-			
-			thanosClient := &collect.ThanosClient{
-				BaseURL: thanosURL,
-				Token:   thanosToken,
-			}
-
-			
-			collectPayload := func(
-				ctx context.Context,
-				id string,
-				version string,
-			) (payload.Payload, error) {
-				return collect.CollectWithThanos(
-					ctx,
-					k8sClient,
-					thanosClient,
-					id,
-					version,
-				)
-			}
-
-			runner := agentrun.Runner{
-				Collect:      collectPayload,
-				ComputeToken: auth.ComputeToken,
-			}
-
-			cfg := agentrun.Config{
-				ClusterID:    clusterID,
-				AgentVersion: agentVersion,
-				CollectorURL: collectorURL,
-				HMACKey:      []byte(hmacKey),
-			}
-
-			if err := runner.Run(ctx, cfg); err != nil {
 				return fmt.Errorf("agent run failed: %w", err)
 			}
 
-			cmd.Println(
-				"Cluster status payload sent successfully",
-			)
-
+			cmd.Println("Cluster status payload sent successfully")
 			return nil
 		},
 	}
 
-	command.Flags().StringVar(
+	cmd.Flags().StringVar(
 		&clusterID,
 		"cluster-id",
 		os.Getenv("OCP_STATUS_CLUSTER_ID"),
-		"Cluster identifier",
+		"OpenShift cluster identifier",
 	)
 
-	command.Flags().StringVar(
+	cmd.Flags().StringVar(
 		&collectorURL,
 		"collector-url",
 		os.Getenv("OCP_STATUS_COLLECTOR_URL"),
-		"Collector HTTP endpoint",
+		"Collector receiving endpoint URL",
 	)
 
-	command.Flags().StringVar(
+	cmd.Flags().StringVar(
 		&thanosURL,
 		"thanos-url",
 		os.Getenv("OCP_STATUS_THANOS_URL"),
 		"Thanos Querier base URL",
 	)
 
-	command.Flags().StringVar(
+	cmd.Flags().StringVar(
 		&thanosToken,
 		"thanos-token",
 		os.Getenv("OCP_STATUS_THANOS_TOKEN"),
-		"Thanos bearer token (prefer environment variable)",
+		"Thanos bearer token; prefer environment variable",
 	)
 
-	command.Flags().StringVar(
+	cmd.Flags().StringVar(
 		&agentVersion,
 		"agent-version",
 		"0.1.0",
-		"Agent version reported in the payload",
+		"Agent version",
 	)
 
-	command.Flags().StringVar(
+	cmd.Flags().StringVar(
 		&kubeconfig,
 		"kubeconfig",
 		os.Getenv("KUBECONFIG"),
-		"Path to kubeconfig (optional inside OpenShift)",
+		"Local kubeconfig file path",
 	)
 
-	return command
+	return cmd
 }
 
 
-var runCmd = newRunCommand()
+func executeAgentRun(
+	ctx context.Context,
+	collector func(context.Context, string, string) (payload.Payload, error),
+	computeToken func([]byte, string) (string, error),
+	httpClient *http.Client,
+	clusterID string,
+	agentVersion string,
+	collectorURL string,
+	key []byte,
+) error {
+	if strings.TrimSpace(clusterID) == "" {
+		return fmt.Errorf("cluster ID is required")
+	}
+	if len(key) == 0 {
+		return fmt.Errorf("HMAC key is required")
+	}
+	if collector == nil || computeToken == nil {
+		return fmt.Errorf("collection and HMAC functions are required")
+	}
+
+	endpoint, err := url.Parse(collectorURL)
+	if err != nil {
+		return fmt.Errorf("invalid collector URL: %w", err)
+	}
+	if (endpoint.Scheme != "http" &&
+		endpoint.Scheme != "https") ||
+		endpoint.Host == "" ||
+		endpoint.User != nil ||
+		endpoint.Fragment != "" {
+		return fmt.Errorf("invalid collector URL")
+	}
+
+	result, err := collector(ctx, clusterID, agentVersion)
+	if err != nil {
+		return fmt.Errorf("collect cluster status: %w", err)
+	}
+	if result.ClusterID != clusterID {
+		return fmt.Errorf("payload cluster ID mismatch")
+	}
 
 
-func kubernetesConfig(path string) (*rest.Config, error) {
+	token, err := computeToken(key, clusterID)
+	if err != nil {
+		return fmt.Errorf("compute HMAC: %w", err)
+	}
+	if token == "" {
+		return fmt.Errorf("computed HMAC token is empty")
+	}
+
+	body, err := json.Marshal(result)
+	if err != nil {
+		return fmt.Errorf("marshal payload: %w", err)
+	}
+
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodPost,
+		endpoint.String(),
+		bytes.NewReader(body),
+	)
+	if err != nil {
+		return fmt.Errorf("create HTTP request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Cluster-ID", clusterID)
+	req.Header.Set("X-Cluster-Token", token)
+
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 15 * time.Second}
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("send payload to collector: %w", err)
+	}
+	defer resp.Body.Close()
+
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf(
+			"collector returned HTTP %d",
+			resp.StatusCode,
+		)
+	}
+
+	return nil
+}
+
+
+func loadKubernetesConfig(path string) (*rest.Config, error) {
 	if path != "" {
 		return clientcmd.BuildConfigFromFlags("", path)
 	}
@@ -176,11 +290,14 @@ func kubernetesConfig(path string) (*rest.Config, error) {
 		return config, nil
 	}
 
-	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		loadingRules,
+		rules,
 		&clientcmd.ConfigOverrides{},
 	)
 
 	return clientConfig.ClientConfig()
 }
+
+
+var runCmd = newRunCommand()
