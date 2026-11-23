@@ -1,0 +1,186 @@
+
+package agent
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/agentrun"
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/auth"
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/collect"
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/payload"
+
+	"github.com/spf13/cobra"
+	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+func newRunCommand() *cobra.Command {
+	var clusterID string
+	var collectorURL string
+	var thanosURL string
+	var thanosToken string
+	var agentVersion string
+	var kubeconfig string
+
+	command := &cobra.Command{
+		Use:   "run",
+		Short: "Collect cluster status and send it to the collector",
+		Args:  cobra.NoArgs,
+
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+
+			
+			hmacKey := os.Getenv("OCP_STATUS_HMAC_KEY")
+
+			if strings.TrimSpace(clusterID) == "" {
+				return fmt.Errorf("cluster ID is required")
+			}
+
+			if strings.TrimSpace(collectorURL) == "" {
+				return fmt.Errorf("collector URL is required")
+			}
+
+			if strings.TrimSpace(thanosURL) == "" {
+				return fmt.Errorf("Thanos URL is required")
+			}
+
+			if hmacKey == "" {
+				return fmt.Errorf(
+					"OCP_STATUS_HMAC_KEY environment variable is required",
+				)
+			}
+
+		
+			restConfig, err := kubernetesConfig(kubeconfig)
+			if err != nil {
+				return fmt.Errorf(
+					"configure Kubernetes client: %w",
+					err,
+				)
+			}
+
+			k8sClient, err := dynamic.NewForConfig(restConfig)
+			if err != nil {
+				return fmt.Errorf(
+					"create Kubernetes client: %w",
+					err,
+				)
+			}
+
+			
+			thanosClient := &collect.ThanosClient{
+				BaseURL: thanosURL,
+				Token:   thanosToken,
+			}
+
+			
+			collectPayload := func(
+				ctx context.Context,
+				id string,
+				version string,
+			) (payload.Payload, error) {
+				return collect.CollectWithThanos(
+					ctx,
+					k8sClient,
+					thanosClient,
+					id,
+					version,
+				)
+			}
+
+			runner := agentrun.Runner{
+				Collect:      collectPayload,
+				ComputeToken: auth.ComputeToken,
+			}
+
+			cfg := agentrun.Config{
+				ClusterID:    clusterID,
+				AgentVersion: agentVersion,
+				CollectorURL: collectorURL,
+				HMACKey:      []byte(hmacKey),
+			}
+
+			if err := runner.Run(ctx, cfg); err != nil {
+				return fmt.Errorf("agent run failed: %w", err)
+			}
+
+			cmd.Println(
+				"Cluster status payload sent successfully",
+			)
+
+			return nil
+		},
+	}
+
+	command.Flags().StringVar(
+		&clusterID,
+		"cluster-id",
+		os.Getenv("OCP_STATUS_CLUSTER_ID"),
+		"Cluster identifier",
+	)
+
+	command.Flags().StringVar(
+		&collectorURL,
+		"collector-url",
+		os.Getenv("OCP_STATUS_COLLECTOR_URL"),
+		"Collector HTTP endpoint",
+	)
+
+	command.Flags().StringVar(
+		&thanosURL,
+		"thanos-url",
+		os.Getenv("OCP_STATUS_THANOS_URL"),
+		"Thanos Querier base URL",
+	)
+
+	command.Flags().StringVar(
+		&thanosToken,
+		"thanos-token",
+		os.Getenv("OCP_STATUS_THANOS_TOKEN"),
+		"Thanos bearer token (prefer environment variable)",
+	)
+
+	command.Flags().StringVar(
+		&agentVersion,
+		"agent-version",
+		"0.1.0",
+		"Agent version reported in the payload",
+	)
+
+	command.Flags().StringVar(
+		&kubeconfig,
+		"kubeconfig",
+		os.Getenv("KUBECONFIG"),
+		"Path to kubeconfig (optional inside OpenShift)",
+	)
+
+	return command
+}
+
+
+var runCmd = newRunCommand()
+
+
+func kubernetesConfig(path string) (*rest.Config, error) {
+	if path != "" {
+		return clientcmd.BuildConfigFromFlags("", path)
+	}
+
+	config, err := rest.InClusterConfig()
+	if err == nil {
+		return config, nil
+	}
+
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		loadingRules,
+		&clientcmd.ConfigOverrides{},
+	)
+
+	return clientConfig.ClientConfig()
+}
