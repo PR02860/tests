@@ -1,0 +1,471 @@
+
+package collect
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"git.bcbssc.com/InformationSystems/ocp_status/internal/payload"
+	"k8s.io/client-go/dynamic"
+)
+
+const maxThanosResponseBytes = 10 << 20
+
+type ThanosClient struct {
+	BaseURL    string
+	Token      string
+	HTTPClient *http.Client
+}
+
+// MetricSample represents a metric value and its labels.
+type MetricSample struct {
+	Labels map[string]string
+	Value  float64
+}
+
+// NodeMetrics contains the six required per-node metrics.
+type NodeMetrics struct {
+	CPUUsageCores       float64
+	CPUCapacityCores    float64
+	MemoryUsageBytes    int64
+	MemoryCapacityBytes int64
+	PodCount            int
+	PodCapacity         int
+}
+
+type thanosResponse struct {
+	Status    string `json:"status"`
+	ErrorType string `json:"errorType"`
+	Error     string `json:"error"`
+	Data      struct {
+		ResultType string `json:"resultType"`
+		Result     []struct {
+			Metric map[string]string `json:"metric"`
+			Value  []json.RawMessage `json:"value"`
+		} `json:"result"`
+	} `json:"data"`
+}
+
+
+func (c *ThanosClient) Query(
+	ctx context.Context,
+	expression string,
+) ([]MetricSample, error) {
+
+	if c == nil {
+		return nil, fmt.Errorf("Thanos client is nil")
+	}
+
+	if strings.TrimSpace(c.BaseURL) == "" {
+		return nil, fmt.Errorf("Thanos URL is required")
+	}
+
+	base, err := url.Parse(c.BaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid Thanos URL: %w", err)
+	}
+
+	if base.Scheme != "http" && base.Scheme != "https" {
+		return nil, fmt.Errorf("unsupported Thanos URL scheme")
+	}
+
+	if base.Host == "" || base.User != nil {
+		return nil, fmt.Errorf("invalid Thanos URL host or credentials")
+	}
+
+	base.Path = strings.TrimRight(base.Path, "/") + "/api/v1/query"
+	base.RawPath = ""
+
+	params := base.Query()
+	params.Set("query", expression)
+	base.RawQuery = params.Encode()
+
+	req, err := http.NewRequestWithContext(
+		ctx,
+		http.MethodGet,
+		base.String(),
+		nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create Thanos request: %w", err)
+	}
+
+	if c.Token != "" {
+		req.Header.Set(
+			"Authorization",
+			"Bearer "+c.Token,
+		)
+	}
+
+	req.Header.Set("Accept", "application/json")
+
+	client := c.HTTPClient
+	if client == nil {
+		client = &http.Client{
+			Timeout: 15 * time.Second,
+		}
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("query Thanos: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf(
+			"Thanos returned HTTP %d",
+			resp.StatusCode,
+		)
+	}
+
+	body, err := io.ReadAll(
+		io.LimitReader(
+			resp.Body,
+			maxThanosResponseBytes+1,
+		),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read Thanos response: %w", err)
+	}
+
+	if len(body) > maxThanosResponseBytes {
+		return nil, fmt.Errorf(
+			"Thanos response exceeds maximum size",
+		)
+	}
+
+	var result thanosResponse
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		return nil, fmt.Errorf(
+			"decode Thanos response: %w",
+			err,
+		)
+	}
+
+	if result.Status != "success" {
+		return nil, fmt.Errorf(
+			"Thanos query failed: %s (%s)",
+			result.Error,
+			result.ErrorType,
+		)
+	}
+
+	if result.Data.ResultType != "vector" {
+		return nil, fmt.Errorf(
+			"unexpected Thanos result type: %s",
+			result.Data.ResultType,
+		)
+	}
+
+	samples := make(
+		[]MetricSample,
+		0,
+		len(result.Data.Result),
+	)
+
+	for _, item := range result.Data.Result {
+		if len(item.Value) != 2 {
+			return nil, fmt.Errorf(
+				"invalid Thanos metric sample",
+			)
+		}
+
+		var valueString string
+
+		if err := json.Unmarshal(
+			item.Value[1],
+			&valueString,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"decode metric value: %w",
+				err,
+			)
+		}
+
+		value, err := strconv.ParseFloat(
+			valueString,
+			64,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"parse metric value: %w",
+				err,
+			)
+		}
+
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, fmt.Errorf(
+				"invalid non-finite metric value: %s",
+				valueString,
+			)
+		}
+
+		samples = append(samples, MetricSample{
+			Labels: item.Metric,
+			Value:  value,
+		})
+	}
+
+	return samples, nil
+}
+
+
+func (c *ThanosClient) CollectNodeMetrics(
+	ctx context.Context,
+) (map[string]NodeMetrics, error) {
+
+	queries := []struct {
+		name       string
+		expression string
+	}{
+		{
+			name: "cpu_usage",
+			expression: `sum by (instance) (
+				rate(node_cpu_seconds_total{mode!="idle"}[5m])
+			)`,
+		},
+		{
+			name: "cpu_capacity",
+			expression: `kube_node_status_capacity{resource="cpu"}`,
+		},
+		{
+			name: "memory_usage",
+			expression: `node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes`,
+		},
+		{
+			name: "memory_capacity",
+			expression: `kube_node_status_capacity{resource="memory"}`,
+		},
+		{
+			name: "pod_count",
+			expression: `count by (node) (kube_pod_info{node!=""})`,
+		},
+		{
+			name: "pod_capacity",
+			expression: `kube_node_status_capacity{resource="pods"}`,
+		},
+	}
+
+	metrics := make(map[string]NodeMetrics)
+
+	seen := make(map[string]map[string]bool)
+
+	for _, query := range queries {
+
+		samples, err := c.Query(
+			ctx,
+			query.expression,
+		)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"collect %s: %w",
+				query.name,
+				err,
+			)
+		}
+
+		if len(samples) == 0 {
+			return nil, fmt.Errorf(
+				"%s: no metrics returned",
+				query.name,
+			)
+		}
+
+		for _, sample := range samples {
+
+			nodeName := sample.Labels["node"]
+
+			if nodeName == "" {
+				nodeName = sample.Labels["instance"]
+			}
+
+			if nodeName == "" {
+				return nil, fmt.Errorf(
+					"%s: missing node identifier",
+					query.name,
+				)
+			}
+
+			if math.IsNaN(sample.Value) ||
+				math.IsInf(sample.Value, 0) ||
+				sample.Value < 0 {
+				return nil, fmt.Errorf(
+					"%s: invalid value for node %s",
+					query.name,
+					nodeName,
+				)
+			}
+
+			if seen[nodeName] == nil {
+				seen[nodeName] = make(
+					map[string]bool,
+				)
+			}
+
+			if seen[nodeName][query.name] {
+				return nil, fmt.Errorf(
+					"%s: duplicate metrics for node %s",
+					query.name,
+					nodeName,
+				)
+			}
+
+			seen[nodeName][query.name] = true
+
+			node := metrics[nodeName]
+
+			switch query.name {
+
+			case "cpu_usage":
+				node.CPUUsageCores = sample.Value
+
+			case "cpu_capacity":
+				node.CPUCapacityCores = sample.Value
+
+			case "memory_usage":
+				if sample.Value >= 0x1p63 {
+					return nil, fmt.Errorf(
+						"memory usage overflow for %s",
+						nodeName,
+					)
+				}
+				node.MemoryUsageBytes = int64(
+					sample.Value,
+				)
+
+			case "memory_capacity":
+				if sample.Value >= 0x1p63 {
+					return nil, fmt.Errorf(
+						"memory capacity overflow for %s",
+						nodeName,
+					)
+				}
+				node.MemoryCapacityBytes = int64(
+					sample.Value,
+				)
+
+			case "pod_count":
+				maxIntExclusive := math.Exp2(
+					float64(strconv.IntSize - 1),
+				)
+
+				if math.Trunc(sample.Value) != sample.Value ||
+					sample.Value >= maxIntExclusive {
+					return nil, fmt.Errorf(
+						"invalid pod count for %s",
+						nodeName,
+					)
+				}
+
+				node.PodCount = int(sample.Value)
+
+			case "pod_capacity":
+				maxIntExclusive := math.Exp2(
+					float64(strconv.IntSize - 1),
+				)
+
+				if math.Trunc(sample.Value) != sample.Value ||
+					sample.Value >= maxIntExclusive {
+					return nil, fmt.Errorf(
+						"invalid pod capacity for %s",
+						nodeName,
+					)
+				}
+
+				node.PodCapacity = int(sample.Value)
+			}
+
+			metrics[nodeName] = node
+		}
+	}
+
+	// Ensure each discovered node has every metric.
+	for nodeName, fields := range seen {
+		for _, query := range queries {
+			if !fields[query.name] {
+				return nil, fmt.Errorf(
+					"node %s missing metric %s",
+					nodeName,
+					query.name,
+				)
+			}
+		}
+	}
+
+	return metrics, nil
+}
+
+
+func EnrichNodesWithMetrics(
+	nodes []payload.Node,
+	metrics map[string]NodeMetrics,
+) {
+	for i := range nodes {
+
+		nodeMetrics, ok := metrics[nodes[i].Name]
+		if !ok {
+			continue
+		}
+
+		nodes[i].CPUUsageCores = nodeMetrics.CPUUsageCores
+		nodes[i].CPUCapacityCores = nodeMetrics.CPUCapacityCores
+
+		nodes[i].MemoryUsageBytes = nodeMetrics.MemoryUsageBytes
+		nodes[i].MemoryCapacityBytes = nodeMetrics.MemoryCapacityBytes
+
+		nodes[i].PodCount = nodeMetrics.PodCount
+		nodes[i].PodCapacity = nodeMetrics.PodCapacity
+	}
+}
+
+
+func CollectWithThanos(
+	ctx context.Context,
+	k8sClient dynamic.Interface,
+	thanosClient *ThanosClient,
+	clusterID string,
+	agentVersion string,
+) (payload.Payload, error) {
+
+	if thanosClient == nil {
+		return payload.Payload{},
+			fmt.Errorf("Thanos client is required")
+	}
+
+	result, err := Collect(
+		ctx,
+		k8sClient,
+		clusterID,
+		agentVersion,
+	)
+	if err != nil {
+		return payload.Payload{},
+			fmt.Errorf(
+				"collect Kubernetes resources: %w",
+				err,
+			)
+	}
+
+	metrics, err := thanosClient.CollectNodeMetrics(ctx)
+	if err != nil {
+		return payload.Payload{},
+			fmt.Errorf(
+				"collect Thanos node metrics: %w",
+				err,
+			)
+	}
+
+	EnrichNodesWithMetrics(result.Nodes, metrics)
+
+	return result, nil
+}
